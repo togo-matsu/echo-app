@@ -1,4 +1,4 @@
-name: Build, Test, and Push Docker Image
+name: CI for Echo App
 
 on:
   push:
@@ -22,7 +22,7 @@ jobs:
       - name: Lint Dockerfile
         uses: hadolint/hadolint-action@v3.1.0
         with:
-          dockerfile: ./apps/echo-app/Dockerfile
+          dockerfile: ./Dockerfile  # ← ルート直下を指定
 
   # -------------------------------------------------------------
   # Job 2: イメージビルド & GHCR プッシュ (Job 1 成功時のみ実行)
@@ -57,9 +57,15 @@ jobs:
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: ./apps/echo-app
+          context: .  # ← ルート直下を指定
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-
+      - name: Trigger Manifest Update
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+          repository: ${{ github.repository_owner }}/k8s-manifests
+          event-type: update-image-tag
+          client-payload: '{"image_tag": "${{ github.sha }}"}'
