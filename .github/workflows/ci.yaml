@@ -25,7 +25,7 @@ jobs:
           dockerfile: ./Dockerfile  # ← ルート直下を指定
 
   # -------------------------------------------------------------
-  # Job 2: イメージビルド & GHCR プッシュ (Job 1 成功時のみ実行)
+  # Job 2: イメージビルド & GHCR プッシュ (Job 1 成功時実行)
   # -------------------------------------------------------------
   build-and-push:
     needs: lint-and-test
@@ -68,4 +68,4 @@ jobs:
           token: ${{ secrets.PAT_TOKEN }}
           repository: ${{ github.repository_owner }}/k8s-manifests
           event-type: update-image-tag
-          client-payload: '{"image_tag": "${{ github.sha }}"}'
+          client-payload: '{"image_tag": "${{ steps.meta.outputs.version }}"}'
