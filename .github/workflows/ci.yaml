@@ -1,67 +1,103 @@
-name: CI for Echo App
+name: CI & DevSecOps Pipeline
 
 on:
   push:
     branches:
       - main
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  pull_request:
+    branches:
+      - main
 
 jobs:
-  # -------------------------------------------------------------
-  # Job 1: コードチェック (Lint & Test)
-  # -------------------------------------------------------------
-  lint-and-test:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Lint Dockerfile
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: ./Dockerfile  # ← ルート直下を指定
-
-  # -------------------------------------------------------------
-  # Job 2: イメージビルド & GHCR プッシュ (Job 1 成功時実行)
-  # -------------------------------------------------------------
-  build-and-push:
-    needs: lint-and-test
+  security-and-build:
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
 
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      # ---------------------------------------------------------
+      # 1. Go セットアップ & SAST (静的コード解析)
+      # ---------------------------------------------------------
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          go-version: '1.22'
+          cache: true
 
-      - name: Extract metadata
+      - name: Run govulncheck (Dependency Vulnerabilities)
+        id: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+
+      - name: Run gosec (Security Code Analysis)
+        id: gosec
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@latest
+          gosec -quiet ./...
+
+      # ---------------------------------------------------------
+      # 2. Docker イメージのビルド (ローカル)
+      # ---------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ghcr.io/${{ github.repository_owner }}/echo-app
           tags: |
-            type=sha,prefix=,format=short
             type=raw,value=latest
+            type=sha,format=short
 
-      - name: Build and push Docker image
+      - name: Build Docker image locally (for scanning)
         uses: docker/build-push-action@v5
         with:
-          context: .  # ← ルート直下を指定
+          context: .
+          load: true # レジストリへプッシュせず、ローカルデーモンにロード
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ---------------------------------------------------------
+      # 3. Trivy によるコンテナイメージ脆弱性スキャン
+      # ---------------------------------------------------------
+      - name: Run Trivy vulnerability scanner
+        id: trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ghcr.io/${{ github.repository_owner }}/echo-app:${{ steps.meta.outputs.version }}
+          format: 'table'
+          exit-code: '1' # CRITICAL または HIGH が見つかった場合、終了コード 1 でビルドを失敗させる
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      # ---------------------------------------------------------
+      # 4. GHCR へのプッシュ (セキュリティ検査通過時のみ実行)
+      # ---------------------------------------------------------
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push Docker image to GHCR
+        uses: docker/build-push-action@v5
+        with:
+          context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
 
+      # ---------------------------------------------------------
+      # 5. 後続マニフェスト更新 (Argo CD 連携)
+      # ---------------------------------------------------------
       - name: Trigger Manifest Update
         uses: peter-evans/repository-dispatch@v3
         with:
@@ -69,3 +105,68 @@ jobs:
           repository: ${{ github.repository_owner }}/k8s-manifests
           event-type: update-image-tag
           client-payload: '{"image_tag": "${{ steps.meta.outputs.version }}"}'
+
+      # ---------------------------------------------------------
+      # 6. セキュリティ検知時の Slack 通知 (失敗時のみ発火)
+      # ---------------------------------------------------------
+      - name: Notify Slack on Security Failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1.26.0
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+        with:
+          payload: |
+            {
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "CI Security Scan Failed"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Repository:*\n${{ github.repository }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Commit SHA:*\n`${{ github.sha }}`"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Triggered By:*\n${{ github.actor }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Branch:*\n`${{ github.ref_name }}`"
+                    }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "重大な脆弱性（Critical/High）またはコードセキュリティ違反が検出され、GHCR へのプッシュおよびデプロイをブロックしました。\n詳細は以下のジョブログを確認してください。"
+                  }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "View Workflow Run"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                      "style": "danger"
+                    }
+                  ]
+                }
+              ]
+            }
