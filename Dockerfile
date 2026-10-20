@@ -1,13 +1,18 @@
-FROM golang:1.24-alpine AS builder
+# 変更前 (例: FROM golang:1.24-alpine など)
+# 変更後: 1.26 系の最新イメージを指定
+FROM golang:1.26-alpine AS builder
+
 WORKDIR /app
+
 COPY go.mod go.sum ./
 RUN go mod download
+
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o echo-app main.go
 
-FROM gcr.io/distroless/static:nonroot
-WORKDIR /
+# 実行環境ステージ（マルチステージビルドの場合）
+FROM alpine:latest
+WORKDIR /root/
 COPY --from=builder /app/echo-app .
-USER 65532:65532
 EXPOSE 8080
-ENTRYPOINT ["/echo-app"]
+CMD ["./echo-app"]
